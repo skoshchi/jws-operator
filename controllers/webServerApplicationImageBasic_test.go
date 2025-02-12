@@ -47,6 +47,7 @@ var _ = Describe("WebServer controller", func() {
 				Expect(webserverstests.WebServerApplicationImageUpdateTest(k8sClient, ctx, thetest, namespace, "updatetest", "quay.io/web-servers/tomcat10:latest", "quay.io/web-servers/tomcat10update:latest", "/health")).Should(Succeed())
 				Expect(webserverstests.WebServerApplicationImageSourcesBasicTest(k8sClient, ctx, thetest, namespace, "sourcesbasictest", "quay.io/web-servers/tomcat10:latest", "https://github.com/web-servers/demo-webapp", "main", "quay.io/"+username+"/test", "secretfortests", "quay.io/web-servers/tomcat10-buildah", randemo)).Should(Succeed())
 				Expect(webserverstests.WebServerApplicationImageSourcesScaleTest(k8sClient, ctx, thetest, namespace, "sourcesscaletest", "quay.io/web-servers/tomcat10:latest", "https://github.com/web-servers/demo-webapp", "main", "quay.io/"+username+"/test", "secretfortests", "quay.io/web-servers/tomcat10-buildah", randemo)).Should(Succeed())
+				Expect(webserverstests.WebServerEnvironmentVariablesTest(k8sClient, ctx, thetest, namespace, "environmentvariablestest", "quay.io/web-servers/tomcat10:latest")).Should(Succeed())
 				isopenshift := webserverstests.WebServerHaveRoutes(k8sClient, ctx, thetest)
 				if isopenshift {
 

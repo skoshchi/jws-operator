@@ -1457,3 +1457,81 @@ func webServerTestFor(clt client.Client, ctx context.Context, t *testing.T, webS
 		return errors.New(URL + " does not contain" + content)
 	}
 }
+
+// WebServerEnvironmentVariablesTest verifies that the operator correctly copies env.
+func WebServerEnvironmentVariablesTest(
+	clt client.Client,
+	ctx context.Context,
+	t *testing.T,
+	namespace string,
+	name string,
+	image string,
+) error {
+
+	// Creating a WebServer with our own env
+	webServer := &webserversv1alpha1.WebServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: webserversv1alpha1.WebServerSpec{
+			ApplicationName: "env-test-app",
+			Replicas:        int32(1),
+			WebImage: &webserversv1alpha1.WebImageSpec{
+				ApplicationImage: image,
+			},
+			EnvironmentVariables: []corev1.EnvVar{
+				{
+					Name:  "ENV_TEST_FIRST",
+					Value: "test1",
+				},
+				{
+					Name:  "ENV_TEST_SECOND",
+					Value: "test2",
+				},
+			},
+		},
+	}
+
+	// Deploy and read
+	err := deployWebServer(clt, ctx, t, webServer)
+	if err != nil {
+		t.Logf("Failed to deploy WebServer due to: %v", err)
+		t.Fatal(err)
+		return err
+	}
+
+	foundDeployment := &kbappsv1.Deployment{}
+	Eventually(func() bool {
+		err := clt.Get(ctx, types.NamespacedName{
+			Name:      webServer.Name,
+			Namespace: webServer.Namespace,
+		}, foundDeployment)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false
+			}
+			t.Logf("Error reading Deployment: %v", err)
+			return false
+		}
+		return foundDeployment.Name == webServer.Name
+	}, time.Second*105, time.Second*15).Should(BeTrue())
+
+	if len(foundDeployment.Spec.Template.Spec.Containers) == 0 {
+		return errors.New("No containers found in Deployment")
+	}
+
+	containerEnv := foundDeployment.Spec.Template.Spec.Containers[0].Env
+	for _, e := range containerEnv {
+		if e.Name != "ENV_TEST_FIRST" || e.Value != "test1" {
+			t.Errorf("One or more environment variables not found in Deployment\n")
+			return err
+		}
+		if e.Name != "ENV_TEST_SECOND" || e.Value != "test2" {
+			t.Errorf("One or more environment variables not found in Deployment\n")
+			return err
+		}
+	}
+	t.Logf("Environment variables are successfully propagated to the Deployment")
+	return nil
+}
