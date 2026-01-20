@@ -117,43 +117,45 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 
 			getURL(name, "/ocp-app/MainApp", []byte{})
 
-			podList := &corev1.PodList{}
-			listOpts := []client.ListOption{
-				client.InNamespace(webserver.Namespace),
-			}
+			Eventually(func() bool {
+				podList := &corev1.PodList{}
+				listOpts := []client.ListOption{
+					client.InNamespace(webserver.Namespace),
+				}
 
-			Expect(k8sClient.List(ctx, podList, listOpts...)).Should(Succeed())
+				err := k8sClient.List(ctx, podList, listOpts...)
+				if err != nil {
+					return false
+				}
 
-			found := false
+				for _, pod := range podList.Items {
+					if strings.Contains(pod.Name, appName) && strings.Contains(pod.Name, "build") {
+						result := restClient.Get().
+							Namespace(namespace).
+							Resource("pods").
+							Name(pod.Name).
+							SubResource("log").
+							Param("container", "sti-build")
 
-			for _, pod := range podList.Items {
-				if strings.Contains(pod.Name, appName) && strings.Contains(pod.Name, "build") {
-					result := restClient.Get().
-						Namespace(namespace).
-						Resource("pods").
-						Name(pod.Name).
-						SubResource("log").
-						Param("container", "sti-build")
+						rc, err := result.Stream(ctx)
+						if err != nil {
+							continue
+						}
 
-					rc, err := result.Stream(ctx)
-					if err != nil {
-						continue
-					}
+						data, err := io.ReadAll(rc)
+						rc.Close()
 
-					data, err := io.ReadAll(rc)
-					Expect(rc.Close()).Should(Succeed())
+						if err != nil {
+							continue
+						}
 
-					if err != nil {
-						continue
-					}
-
-					if bytes.Contains(data, []byte(mavenMirrorURL)) {
-						found = true
+						if bytes.Contains(data, []byte(mavenMirrorURL)) {
+							return true
+						}
 					}
 				}
-			}
-
-			Expect(found).Should(BeTrue())
+				return false
+			}, time.Minute*5, time.Second*5).Should(BeTrue(), "Maven mirror URL not found in build logs")
 		})
 
 		It("ArtifactAndContextDirUpdateTest", func() {

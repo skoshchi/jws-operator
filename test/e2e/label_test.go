@@ -76,7 +76,7 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 			key := "my-new-label"
 			value := "label-string-1"
 
-			// Update labals and update the WebServer
+			// Update labels and update the WebServer
 			Eventually(func() bool {
 				createdWebserver := getWebServer(name)
 
@@ -103,7 +103,7 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 
 			Expect(checkLabel(appName, key, value)).Should(BeTrue())
 
-			// Update labals and update the WebServer
+			// Update labels and update the WebServer
 			Eventually(func() bool {
 				createdWebserver := getWebServer(name)
 
@@ -121,7 +121,21 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 				return true
 			}, time.Second*30, time.Millisecond*250).Should(BeTrue())
 
-			Expect(checkLabel(appName, key, value)).Should(BeFalse())
+			deployment := &kbappsv1.Deployment{}
+			deploymentLookupKey := types.NamespacedName{Name: appName, Namespace: namespace}
+
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, deploymentLookupKey, deployment)
+				if err != nil {
+					return false
+				}
+
+				_, okTemplate := deployment.Spec.Template.Labels[key]
+				_, okDep := deployment.Labels[key]
+
+				return !okTemplate && !okDep
+
+			}, time.Minute*5, time.Second*1).Should(BeTrue(), "Label was not removed from deployment")
 		})
 
 		It("SelectorTest", func() {
@@ -175,7 +189,7 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 				}
 				Expect(k8sClient.List(ctx, podList, listOpts...)).Should(Succeed())
 
-				return webserver.Spec.Replicas != int32(len(podList.Items))
+				return webserver.Spec.Replicas == int32(len(podList.Items))
 			}, time.Second*300, time.Millisecond*500).Should(BeTrue(), "The number of deployed pods with metering labels does not match the WebServer specification podList.")
 		})
 	})
@@ -186,11 +200,16 @@ func checkLabel(appName string, key string, value string) bool {
 	deployment := &kbappsv1.Deployment{}
 	deploymentookupKey := types.NamespacedName{Name: appName, Namespace: namespace}
 
+	// We wait until the label appears or the time expires.
 	Eventually(func() bool {
 		err := k8sClient.Get(ctx, deploymentookupKey, deployment)
-		return err == nil
-	}, time.Second*10, time.Millisecond*250).Should(BeTrue())
+		if err != nil {
+			return false
+		}
 
-	// check the label
-	return deployment.Spec.Template.GetLabels()[key] == value
+		currentValue, ok := deployment.Spec.Template.GetLabels()[key]
+		return ok && currentValue == value
+	}, time.Minute*2, time.Second*1).Should(BeTrue(), fmt.Sprintf("Label %s=%s not found on deployment %s", key, value, appName))
+
+	return true
 }

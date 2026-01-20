@@ -153,8 +153,7 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 # Prerequisite: the operator is installed and avialable in the cluster
 .PHONY: test-e2e-real
 test-e2e-real: setup-namespace generate fmt vet
-	NAMESPACE_FOR_TESTING=$(NAMESPACE_FOR_TESTING) TEST_IMG=$(TEST_IMG) go test ./test/e2e/ -v -timeout=60m -ginkgo.vv -ginkgo.focus $(EXECUTE_TEST) $(TEST_PARAM)
-
+	NAMESPACE_FOR_TESTING=$(NAMESPACE_FOR_TESTING) TEST_IMG=$(TEST_IMG) go test ./test/e2e/ -v -timeout=60m -ginkgo.vv -ginkgo.focus $(EXECUTE_TEST) --ginkgo.junit-report=junit-report.xml $(TEST_PARAM)
 .PHONY: setup-namespace
 setup-namespace:
 	$(KUBECTL) create namespace $(NAMESPACE_FOR_TESTING) || true

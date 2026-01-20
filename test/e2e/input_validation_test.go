@@ -33,7 +33,7 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 	name := "validation-test"
 	appName := "test-tomcat"
 
-	Context("InputValicationTest", func() {
+	Context("InputValidationTest", func() {
 		It("NameTest", func() {
 			webserver := &webserversv1alpha1.WebServer{
 				ObjectMeta: metav1.ObjectMeta{

@@ -138,15 +138,16 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 		Expect(k8sClient.Create(ctx, route)).Should(Succeed())
 
 		foundRoute := &routev1.Route{}
-		Eventually(func() bool {
-			err := k8sClient.Get(ctx, types.NamespacedName{Name: routeName, Namespace: namespace}, foundRoute)
-			return err == nil
-		}, "1m", "1s").Should(BeTrue())
-
 		Eventually(func() string {
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: routeName, Namespace: namespace}, foundRoute)
+			if err != nil {
+				return ""
+			}
+
 			host = utils.GetHost(foundRoute)
+
 			return host
-		}, "1m", "1s").ShouldNot(BeEmpty())
+		}, "3m", "5s").ShouldNot(BeEmpty())
 
 		webserver.Spec.TLSConfig.RouteHostname = "tls:hosttest-" + namespace + "." + host[4:]
 
