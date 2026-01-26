@@ -120,7 +120,12 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 					},
 				},
 			}
+			err := k8sClient.Create(ctx, webserver)
+			if err != nil {
+				return
+			}
 
+			time.Sleep(4 * time.Minute)
 			Expect(k8sClient.Create(ctx, webserver)).ShouldNot(Succeed())
 		})
 
