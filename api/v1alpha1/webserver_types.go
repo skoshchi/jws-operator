@@ -78,6 +78,8 @@ type VolumeSpec struct {
 // (Deployment method 1) Application image
 type WebImageSpec struct {
 	// The name of the application image to be deployed
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Application Image",order=1
 	ApplicationImage string `json:"applicationImage"`
 	// secret to pull from the docker repository
