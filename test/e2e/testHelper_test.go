@@ -189,7 +189,7 @@ func checkOperatorLogs() {
 
 	listOpts := []client.ListOption{
 		client.MatchingLabels(labels),
-		client.InNamespace(namespace),
+		//client.InNamespace(namespace),
 	}
 	Expect(k8sClient.List(ctx, podList, listOpts...)).Should(Succeed())
 	Expect(podList.Items).Should(HaveLen(1), fmt.Sprintf("Not able to find operator pod: len(podList.Items) = %d", len(podList.Items)))
