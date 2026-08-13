@@ -74,6 +74,56 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 					WebAppWarImage:           pushedimage,
 					Builder: &webserversv1alpha1.BuilderSpec{
 						Image: imagebuilder,
+						// Temporarily using custom build script to work around Maven Central rate-limiting.
+						// To revert: remove ApplicationBuildScript to use the default build.sh from the builder image.
+						ApplicationBuildScript: `#!/bin/sh
+cd tmp
+mkdir -p /tmp/.m2/repo
+cat > /tmp/.m2/settings.xml << 'SETTINGS_EOF'
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+<localRepository>/tmp/.m2/repo</localRepository>
+<mirrors>
+  <mirror>
+    <id>google-maven-central</id>
+    <mirrorOf>central</mirrorOf>
+    <url>https://maven-central.storage-download.googleapis.com/maven2/</url>
+  </mirror>
+</mirrors>
+</settings>
+SETTINGS_EOF
+
+if [ -z ${webAppSourceRepositoryURL} ]; then
+	echo "Need an URL like https://github.com/jfclere/demo-webapp.git"
+	exit 1
+fi
+git clone ${webAppSourceRepositoryURL}
+if [ $? -ne 0 ]; then
+	echo "Can't clone ${webAppSourceRepositoryURL}"
+	exit 1
+fi
+DIR=$(echo ${webAppSourceRepositoryURL##*/})
+DIR=$(echo ${DIR%%.*})
+cd ${DIR}
+if [ ! -z ${webAppSourceRepositoryRef} ]; then
+	git checkout ${webAppSourceRepositoryRef}
+fi
+if [ ! -z ${webAppSourceRepositoryContextDir} ]; then
+	cd ${webAppSourceRepositoryContextDir}
+fi
+mvn clean install -gs /tmp/.m2/settings.xml
+if [ $? -ne 0 ]; then
+	echo "mvn install failed please check the pom.xml in ${webAppSourceRepositoryURL}"
+	exit 1
+fi
+echo "Copies the resulting war to deployments/${webAppWarFileName}"
+mkdir /tmp/deployments
+cp /tmp/*/target/*.war /tmp/deployments/${webAppWarFileName}
+cd /tmp
+HOME=/tmp
+STORAGE_DRIVER=vfs buildah bud -f /Dockerfile.JWS -t ${webAppWarImage} --authfile /auth/.dockerconfigjson --build-arg webAppSourceImage=${webAppSourceImage}
+STORAGE_DRIVER=vfs buildah push --authfile /auth/.dockerconfigjson ${webAppWarImage}
+`,
 					},
 				},
 			},
