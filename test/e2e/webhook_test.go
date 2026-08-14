@@ -108,6 +108,8 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 					ContextDir:          contextDir,
 					WebSourcesParams: &webserversv1alpha1.WebSourcesParamsSpec{
 						ArtifactDir: artifactDir,
+						// Temporarily using Maven mirror to work around Maven Central rate-limiting.
+						MavenMirrorURL: "https://maven-central.storage-download.googleapis.com/maven2/",
 					},
 					WebhookSecrets: &webserversv1alpha1.WebhookSecrets{
 						Generic: secret.Name,
