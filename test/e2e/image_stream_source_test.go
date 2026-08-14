@@ -82,6 +82,10 @@ var _ = Describe("WebServerControllerTest", Ordered, func() {
 				WebSources: &webserversv1alpha1.WebSourcesSpec{
 					SourceRepositoryURL: sourceRepositoryURL,
 					SourceRepositoryRef: sourceRepositoryRef,
+					// Temporarily using Maven mirror to work around Maven Central rate-limiting.
+					WebSourcesParams: &webserversv1alpha1.WebSourcesParamsSpec{
+						MavenMirrorURL: "https://maven-central.storage-download.googleapis.com/maven2/",
+					},
 				},
 			},
 		},
