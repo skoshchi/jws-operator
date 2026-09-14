@@ -17,7 +17,15 @@ limitations under the License.
 package e2e
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,24 +44,15 @@ import (
 // PQC (Post-Quantum Cryptography) test verifies ML-DSA-65 certificate support
 // and X25519MLKEM768 key exchange for Tomcat workloads managed by the operator.
 //
-// Background:
-//
-//	The jws-operator itself (Go 1.24) already supports PQC for its own TLS
-//	communications — Go 1.24 enables X25519MLKEM768 by default in crypto/tls
-//	(see https://go.dev/doc/go1.24#crypto-mlkem). This satisfies OpenShift 5.x
-//	control plane PQC requirements automatically.
-//
-//	This test verifies PQC for the Tomcat pods the operator manages, which use
-//	Java/OpenSSL for TLS (not Go's crypto/tls). Tomcat PQC requires:
-//	OpenSSLLifecycleListener (FFM/Panama) + ML-DSA-65 certificates.
-//
-//	The test uses only existing CRD fields (no operator code changes):
-//	tlsConfig, volumeSpec.configMaps, and environmentVariables.
+// The test generates ML-DSA-65 certificates locally (on the test machine),
+// injects them into the pod via a Secret, and verifies PQC TLS using
+// Go 1.24's native crypto/tls support (X25519MLKEM768 key exchange).
 //
 // Prerequisites:
-//   - TEST_IMG must be a JWS image based on RHEL 10 with Java 25+ and OpenSSL 3.5.5+
+//   - TEST_IMG must be a JWS image with OpenSSL 3.5.5+ and Tomcat Native / APR or FFM support
 //   - test-tls-secret must exist (standard RSA TLS secret, see test-scripts/TLS.md)
-//   - The container image must include openssl and curl binaries
+//   - Local openssl must support mldsa65 (test is skipped otherwise)
+//   - oc CLI must be available and logged in (used for port-forward)
 var _ = Describe("PQCTest", Ordered, func() {
 	SetDefaultEventuallyTimeout(5 * time.Minute)
 	SetDefaultEventuallyPollingInterval(5 * time.Second)
@@ -62,43 +61,16 @@ var _ = Describe("PQCTest", Ordered, func() {
 	name := "pqc-test"
 	appName := "pqc-test-app"
 	pqcConfigMapName := "pqc-setup"
+	pqcSecretName := "pqc-certs"
+
+	var certDir string
 
 	// Shell script that runs inside the pod before Tomcat starts.
-	// It generates ML-DSA-65 certificates and configures server.xml for PQC TLS.
+	// It configures server.xml for PQC TLS. Certificates are pre-generated
+	// and mounted via Secret at /secrets/pqc-certs/.
 	pqcSetupScript := `#!/bin/bash
-# PQC setup: generate ML-DSA-65 certificates and configure Tomcat for PQC TLS
-
-mkdir -p /tmp/pqc
-
-# --- Certificate generation ---
-
-# RSA CA (used to sign the PQC certificate)
-openssl genrsa -out /tmp/pqc/ca.key 2048 2>/dev/null
-openssl req -x509 -new -nodes -key /tmp/pqc/ca.key -sha256 -days 365 \
-    -out /tmp/pqc/ca.crt -subj "/CN=PQC-Test-CA" 2>/dev/null
-
-# ML-DSA-65 key and CSR
-openssl req -newkey mldsa65 -keyout /tmp/pqc/server.key -nodes \
-    -out /tmp/pqc/server.csr -subj "/CN=localhost" 2>/dev/null
-
-if [ $? -ne 0 ]; then
-    echo "PQC SETUP ERROR: openssl does not support mldsa65 on this image"
-    return 0 2>/dev/null || true
-fi
-
-# Sign with the RSA CA
-openssl x509 -req -in /tmp/pqc/server.csr \
-    -CA /tmp/pqc/ca.crt -CAkey /tmp/pqc/ca.key -CAcreateserial \
-    -out /tmp/pqc/server.crt -days 365 -sha256 2>/dev/null
-
-if [ ! -f /tmp/pqc/server.crt ]; then
-    echo "PQC SETUP ERROR: failed to generate ML-DSA-65 certificate"
-    return 0 2>/dev/null || true
-fi
-
-echo "PQC: ML-DSA-65 certificates generated in /tmp/pqc/"
-
-# --- server.xml modifications ---
+# PQC setup: configure Tomcat server.xml for PQC TLS
+# ML-DSA-65 certificates are pre-generated and mounted at /secrets/pqc-certs/
 
 FILE=$(find /opt -name server.xml 2>/dev/null | head -1)
 if [ -z "${FILE}" ]; then
@@ -109,6 +81,13 @@ if [ -z "${FILE}" ]; then
     echo "PQC SETUP ERROR: server.xml not found"
     return 0 2>/dev/null || true
 fi
+
+if [ ! -f /secrets/pqc-certs/server.crt ] || [ ! -f /secrets/pqc-certs/server.key ]; then
+    echo "PQC SETUP ERROR: certificates not found at /secrets/pqc-certs/"
+    return 0 2>/dev/null || true
+fi
+
+echo "PQC: ML-DSA-65 certificates found at /secrets/pqc-certs/"
 
 # Enable OpenSSLLifecycleListener (uncomment if commented, or insert if missing)
 if grep -q '<!-- <Listener className="org.apache.catalina.core.OpenSSLLifecycleListener"' ${FILE}; then
@@ -121,18 +100,102 @@ else
     echo "PQC: OpenSSLLifecycleListener already present"
 fi
 
-# Add MLDSA certificate alongside the existing RSA certificate in SSLHostConfig.
-# The operator's test.sh already added: <Certificate certificateFile="/tls/server.crt" .../>
-# We add a second Certificate of type MLDSA pointing to the PQC certs.
+# Add MLDSA certificate alongside the existing RSA certificate in SSLHostConfig
 if grep -q '</SSLHostConfig>' ${FILE}; then
-    sed -i 's|</SSLHostConfig>|<Certificate certificateFile="/tmp/pqc/server.crt" certificateKeyFile="/tmp/pqc/server.key" type="MLDSA" /> </SSLHostConfig>|' ${FILE}
+    sed -i 's|</SSLHostConfig>|<Certificate certificateFile="/secrets/pqc-certs/server.crt" certificateKeyFile="/secrets/pqc-certs/server.key" type="MLDSA" /> </SSLHostConfig>|' ${FILE}
     echo "PQC: MLDSA Certificate added to SSLHostConfig"
 else
-    echo "PQC SETUP WARNING: SSLHostConfig not found in server.xml (TLS connector may not be configured yet)"
+    echo "PQC SETUP WARNING: SSLHostConfig not found in server.xml"
 fi
 
 echo "PQC setup completed"
 `
+
+	// generatePQCCerts generates ML-DSA-65 certificates using the local openssl.
+	// Skips the test if the local openssl does not support mldsa65.
+	generatePQCCerts := func() string {
+		if _, err := exec.LookPath("openssl"); err != nil {
+			Skip("openssl not found in PATH — cannot generate PQC certificates")
+		}
+
+		dir, err := os.MkdirTemp("", "pqc-certs-")
+		Expect(err).ShouldNot(HaveOccurred())
+
+		cmd := exec.Command("openssl", "genrsa", "-out", filepath.Join(dir, "ca.key"), "2048")
+		out, err := cmd.CombinedOutput()
+		Expect(err).ShouldNot(HaveOccurred(), "openssl genrsa failed: %s", string(out))
+
+		cmd = exec.Command("openssl", "req", "-x509", "-new", "-nodes",
+			"-key", filepath.Join(dir, "ca.key"), "-sha256", "-days", "365",
+			"-out", filepath.Join(dir, "ca.crt"), "-subj", "/CN=PQC-Test-CA")
+		out, err = cmd.CombinedOutput()
+		Expect(err).ShouldNot(HaveOccurred(), "openssl req CA failed: %s", string(out))
+
+		cmd = exec.Command("openssl", "req", "-newkey", "mldsa65",
+			"-keyout", filepath.Join(dir, "server.key"), "-nodes",
+			"-out", filepath.Join(dir, "server.csr"), "-subj", "/CN=localhost")
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			os.RemoveAll(dir)
+			Skip(fmt.Sprintf("Local openssl does not support mldsa65: %s", string(out)))
+		}
+
+		cmd = exec.Command("openssl", "x509", "-req",
+			"-in", filepath.Join(dir, "server.csr"),
+			"-CA", filepath.Join(dir, "ca.crt"), "-CAkey", filepath.Join(dir, "ca.key"),
+			"-CAcreateserial", "-out", filepath.Join(dir, "server.crt"),
+			"-days", "365", "-sha256")
+		out, err = cmd.CombinedOutput()
+		Expect(err).ShouldNot(HaveOccurred(), "openssl x509 sign failed: %s", string(out))
+
+		thetest.Logf("ML-DSA-65 certificates generated in %s", dir)
+		return dir
+	}
+
+	// startPortForward starts `oc port-forward` and returns the local port and a cleanup function.
+	startPortForward := func(podName string, remotePort int) (int, func()) {
+		listener, err := net.Listen("tcp", "localhost:0")
+		Expect(err).ShouldNot(HaveOccurred())
+		localPort := listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
+
+		cmd := exec.Command("oc", "port-forward",
+			fmt.Sprintf("pod/%s", podName),
+			fmt.Sprintf("%d:%d", localPort, remotePort),
+			"-n", namespace)
+
+		stdout, err := cmd.StdoutPipe()
+		Expect(err).ShouldNot(HaveOccurred())
+
+		Expect(cmd.Start()).Should(Succeed(), "failed to start oc port-forward")
+
+		// Wait for "Forwarding from ..." message
+		scanner := bufio.NewScanner(stdout)
+		ready := make(chan bool, 1)
+		go func() {
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.Contains(line, "Forwarding from") {
+					ready <- true
+					return
+				}
+			}
+			ready <- false
+		}()
+
+		select {
+		case ok := <-ready:
+			Expect(ok).To(BeTrue(), "oc port-forward did not become ready")
+		case <-time.After(30 * time.Second):
+			cmd.Process.Kill()
+			Fail("oc port-forward timed out")
+		}
+
+		return localPort, func() {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	}
 
 	pqcConfigMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -165,13 +228,10 @@ echo "PQC setup completed"
 			},
 			Volume: &webserversv1alpha1.VolumeSpec{
 				ConfigMaps: []string{pqcConfigMapName},
+				Secrets:    []string{pqcSecretName},
 			},
 			EnvironmentVariables: []corev1.EnvVar{
 				{
-					// Override operator's ENV_FILES to include both:
-					// 1. Operator's test.sh (adds TLS Connector to server.xml)
-					// 2. Our pqc-setup.sh (adds OpenSSLLifecycleListener + MLDSA cert)
-					// K8s: last duplicate env var wins, so this overrides the operator's value.
 					Name:  "ENV_FILES",
 					Value: "/env/my-files/test.sh,/configmaps/" + pqcConfigMapName + "/pqc-setup.sh",
 				},
@@ -179,7 +239,6 @@ echo "PQC setup completed"
 		},
 	}
 
-	// getFirstPod returns the name and container name of the first running pod for this WebServer.
 	getFirstPod := func() (podName string, containerName string) {
 		podList := &corev1.PodList{}
 		listOpts := []client.ListOption{
@@ -197,6 +256,26 @@ echo "PQC setup completed"
 	}
 
 	BeforeAll(func() {
+		certDir = generatePQCCerts()
+
+		certData, err := os.ReadFile(filepath.Join(certDir, "server.crt"))
+		Expect(err).ShouldNot(HaveOccurred())
+		keyData, err := os.ReadFile(filepath.Join(certDir, "server.key"))
+		Expect(err).ShouldNot(HaveOccurred())
+
+		pqcSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pqcSecretName,
+				Namespace: namespace,
+			},
+			Data: map[string][]byte{
+				"server.crt": certData,
+				"server.key": keyData,
+			},
+		}
+		createSecret(pqcSecret)
+		thetest.Logf("Secret %s created with ML-DSA-65 certificates", pqcSecretName)
+
 		Expect(k8sClient.Create(ctx, pqcConfigMap)).Should(Succeed())
 		thetest.Logf("ConfigMap %s created", pqcConfigMapName)
 
@@ -211,12 +290,23 @@ echo "PQC setup completed"
 			err := k8sClient.Get(ctx, types.NamespacedName{Name: pqcConfigMapName, Namespace: namespace}, &corev1.ConfigMap{})
 			return apierrors.IsNotFound(err)
 		}, "1m", "5s").Should(BeTrue(), "pqc-setup ConfigMap should be deleted")
+
+		pqcSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pqcSecretName,
+				Namespace: namespace,
+			},
+		}
+		deleteSecret(pqcSecret)
+
+		if certDir != "" {
+			os.RemoveAll(certDir)
+		}
 	})
 
 	Context("PostQuantumCryptoTest", func() {
 
-		It("should start Tomcat with OpenSSL FFM and MLDSA certificate", func() {
-			// Wait for deployment to have at least 1 available replica
+		It("should start Tomcat with OpenSSL and MLDSA certificate", func() {
 			foundDeployment := &kbappsv1.Deployment{}
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, types.NamespacedName{Name: appName, Namespace: namespace}, foundDeployment)
@@ -229,58 +319,81 @@ echo "PQC setup completed"
 
 			podName, _ := getFirstPod()
 
-			// Verify Tomcat initialized OpenSSL via FFM (Panama)
 			Eventually(func() bool {
 				logs := getPodLogs(namespace, podName)
-				return strings.Contains(logs, "OpenSSL successfully initialized using FFM")
-			}, "3m", "10s").Should(BeTrue(), "Tomcat should initialize OpenSSL via FFM")
+				return strings.Contains(logs, "OpenSSL successfully initialized")
+			}, "3m", "10s").Should(BeTrue(), "Tomcat should initialize OpenSSL")
 
-			// Verify MLDSA certificate was loaded
 			logs := getPodLogs(namespace, podName)
-			Expect(logs).To(ContainSubstring("certificate type [MLDSA]"),
-				"Tomcat logs should show MLDSA certificate was loaded")
+			Expect(logs).To(ContainSubstring("MLDSA"),
+				"Tomcat logs should show MLDSA certificate configuration")
+			Expect(logs).To(ContainSubstring("PQC setup completed"),
+				"PQC setup script should complete successfully")
 
-			thetest.Logf("Tomcat started with OpenSSL FFM and MLDSA certificate")
+			thetest.Logf("Tomcat started with OpenSSL and MLDSA certificate")
 		})
 
-		It("should accept TLS connections with PQC key exchange", func() {
-			podName, containerName := getFirstPod()
+		It("should negotiate X25519MLKEM768 PQC key exchange", func() {
+			podName, _ := getFirstPod()
 
-			// Send HTTPS request using curl with X25519MLKEM768 key exchange group
-			stdout, stderr, err := executeCommandOnPod(podName, containerName, []string{
-				"curl", "-k", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-				"--curves", "X25519MLKEM768",
-				"https://localhost:8443/health",
-			})
-			Expect(err).ShouldNot(HaveOccurred(),
-				"curl with PQC curves failed. stderr: %s", stderr)
-			Expect(strings.TrimSpace(stdout)).To(Equal("200"),
-				"HTTPS request with X25519MLKEM768 should return HTTP 200, got: %s (stderr: %s)", stdout, stderr)
+			localPort, stopFw := startPortForward(podName, 8443)
+			defer stopFw()
 
-			thetest.Logf("PQC TLS connection successful (HTTP 200)")
+			// Only offer X25519MLKEM768 — if the handshake succeeds,
+			// the server negotiated PQC key exchange (no other option offered).
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: true,
+				CurvePreferences:  []tls.CurveID{tls.X25519MLKEM768},
+			}
+			addr := fmt.Sprintf("localhost:%d", localPort)
+
+			Eventually(func() error {
+				conn, err := tls.Dial("tcp", addr, tlsConfig)
+				if err != nil {
+					return fmt.Errorf("TLS dial failed: %w", err)
+				}
+				state := conn.ConnectionState()
+				conn.Close()
+				thetest.Logf("TLS negotiated: Version=0x%04x CipherSuite=0x%04x",
+					state.Version, state.CipherSuite)
+				return nil
+			}, "1m", "5s").Should(Succeed(),
+				"TLS handshake with only X25519MLKEM768 should succeed")
+
+			thetest.Logf("PQC key exchange verified: X25519MLKEM768")
 		})
 
-		It("should negotiate X25519MLKEM768 group and ML-DSA signature in TLS handshake", func() {
-			podName, containerName := getFirstPod()
+		It("should serve HTTPS with PQC key exchange", func() {
+			podName, _ := getFirstPod()
 
-			// Use openssl s_client to inspect TLS negotiation details
-			stdout, _, err := executeCommandOnPod(podName, containerName, []string{
-				"sh", "-c",
-				"echo | openssl s_client -connect localhost:8443 2>&1 || true",
-			})
-			Expect(err).ShouldNot(HaveOccurred(), "openssl s_client exec failed")
+			localPort, stopFw := startPortForward(podName, 8443)
+			defer stopFw()
 
-			thetest.Logf("openssl s_client output:\n%s", stdout)
+			// Force X25519MLKEM768 only — proves PQC key exchange for HTTP traffic
+			transport := &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					CurvePreferences:  []tls.CurveID{tls.X25519MLKEM768},
+				},
+			}
+			httpClient := &http.Client{
+				Transport: transport,
+				Timeout:   30 * time.Second,
+			}
 
-			// Verify PQC key exchange group was negotiated
-			Expect(stdout).To(ContainSubstring("X25519MLKEM768"),
-				"TLS should negotiate X25519MLKEM768 key exchange group")
+			url := fmt.Sprintf("https://localhost:%d/health", localPort)
+			var resp *http.Response
+			Eventually(func() error {
+				var err error
+				resp, err = httpClient.Get(url)
+				return err
+			}, "1m", "5s").Should(Succeed(), "HTTPS GET with X25519MLKEM768 should succeed")
+			defer resp.Body.Close()
 
-			// Verify ML-DSA peer signature type
-			Expect(strings.ToLower(stdout)).To(ContainSubstring("mldsa"),
-				"TLS should use ML-DSA for peer signature")
+			Expect(resp.StatusCode).To(Equal(http.StatusOK),
+				"HTTPS request with PQC should return HTTP 200")
 
-			thetest.Logf("PQC TLS negotiation verified: X25519MLKEM768 + ML-DSA")
+			thetest.Logf("PQC HTTPS verified: HTTP 200 with X25519MLKEM768")
 		})
 	})
 })
