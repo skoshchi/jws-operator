@@ -100,7 +100,12 @@ else
     echo "PQC: OpenSSLLifecycleListener already present"
 fi
 
-# Add MLDSA certificate alongside the existing RSA certificate in SSLHostConfig
+# When multiple certificates exist, Tomcat requires each to have a type attribute.
+# The operator's test.sh creates Certificate without type — add type="RSA" to it.
+sed -i 's|<Certificate certificateFile="/tls/server.crt" certificateKeyFile="/tls/server.key"/>|<Certificate certificateFile="/tls/server.crt" certificateKeyFile="/tls/server.key" type="RSA"/>|' ${FILE}
+echo "PQC: type=RSA added to existing certificate"
+
+# Add MLDSA certificate alongside the RSA certificate in SSLHostConfig
 if grep -q '</SSLHostConfig>' ${FILE}; then
     sed -i 's|</SSLHostConfig>|<Certificate certificateFile="/secrets/pqc-certs/server.crt" certificateKeyFile="/secrets/pqc-certs/server.key" type="MLDSA" /> </SSLHostConfig>|' ${FILE}
     echo "PQC: MLDSA Certificate added to SSLHostConfig"
